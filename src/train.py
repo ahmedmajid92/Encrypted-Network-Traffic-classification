@@ -1,24 +1,26 @@
 """
-Phase 3: Training Pipeline for Rotary FT-Transformer
-=====================================================
-Rigorous training with GroupKFold cross-validation to prevent flow leakage.
+Phase 3: Training Pipeline for Rotary FT-Transformer (FAST VERSION)
+====================================================================
+Uses pre-processed data splits for fast iteration.
 
-PhD Research: Encrypted Traffic Classification
+Run preprocess.py first:
+    python src/preprocess.py
+
+Then train:
+    python src/train.py --epochs 10 --batch-size 8192
 """
 
 import argparse
 import logging
+import pickle
 import time
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import GroupKFold
-from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import accuracy_score, f1_score
 
 from models import create_model
@@ -31,79 +33,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Feature configuration
-CATEGORICAL_FEATURES = [
-    'ip_version', 'ip_proto', 'ip_tos', 'tcp_flags', 'tcp_dataofs',
-    'tcp_seq_high', 'tcp_seq_low', 'tcp_ack_high', 'tcp_ack_low'
-]
 
-NUMERICAL_FEATURES = [
-    'ip_len', 'ip_ttl', 'ip_chksum', 'tcp_window', 'udp_len', 'tcp_urg',
-    'ip_ihl', 'ip_id', 'ip_flags', 'ip_frag', 'udp_chksum'
-]
-
-# Note: tcp_dataofs is the column name in our dataset (scapy uses dataofs)
-
-
-class TrafficDataset:
-    """Preprocessor and dataset handler for traffic classification."""
+def load_preprocessed_data(data_dir: Path):
+    """Load pre-processed train/val/test splits and preprocessor."""
     
-    def __init__(self, df: pd.DataFrame, cat_features: list, num_features: list):
-        self.df = df.copy()
-        self.cat_features = cat_features
-        self.num_features = num_features
-        
-        # Encoders and scalers
-        self.label_encoders = {}
-        self.scaler = StandardScaler()
-        self.cat_cardinalities = {}
-        
-    def preprocess(self):
-        """Apply preprocessing: handle missing values, encode categoricals, scale numericals."""
-        logger.info("Preprocessing data...")
-        
-        # Replace -1 sentinel values with 0
-        for col in self.cat_features + self.num_features:
-            if col in self.df.columns:
-                self.df[col] = self.df[col].replace(-1, 0)
-                self.df[col] = self.df[col].fillna(0)
-        
-        # Encode categorical features
-        for col in self.cat_features:
-            if col in self.df.columns:
-                le = LabelEncoder()
-                self.df[col] = le.fit_transform(self.df[col].astype(str))
-                self.label_encoders[col] = le
-                self.cat_cardinalities[col] = len(le.classes_)
-            else:
-                logger.warning(f"Categorical feature '{col}' not found, using placeholder")
-                self.df[col] = 0
-                self.cat_cardinalities[col] = 1
-        
-        # Scale numerical features
-        num_cols_present = [c for c in self.num_features if c in self.df.columns]
-        if num_cols_present:
-            self.df[num_cols_present] = self.scaler.fit_transform(self.df[num_cols_present])
-        
-        # Fill missing numerical columns
-        for col in self.num_features:
-            if col not in self.df.columns:
-                logger.warning(f"Numerical feature '{col}' not found, using zeros")
-                self.df[col] = 0.0
-        
-        logger.info(f"  Categorical: {len(self.cat_features)} features")
-        logger.info(f"  Numerical: {len(self.num_features)} features")
-        logger.info(f"  Cardinalities: {self.cat_cardinalities}")
-        
-    def get_tensors(self, indices: np.ndarray):
-        """Get PyTorch tensors for given indices."""
-        subset = self.df.iloc[indices]
-        
-        x_cat = torch.tensor(subset[self.cat_features].values, dtype=torch.long)
-        x_num = torch.tensor(subset[self.num_features].values, dtype=torch.float32)
-        y = torch.tensor(subset['label_binary'].values, dtype=torch.long)
-        
-        return x_cat, x_num, y
+    preprocessor_path = data_dir / "preprocessor.pkl"
+    if not preprocessor_path.exists():
+        raise FileNotFoundError(
+            f"Preprocessor not found at {preprocessor_path}. "
+            "Run 'python src/preprocess.py' first!"
+        )
+    
+    with open(preprocessor_path, 'rb') as f:
+        preprocessor = pickle.load(f)
+    
+    train_df = pd.read_parquet(data_dir / "train.parquet")
+    val_df = pd.read_parquet(data_dir / "val.parquet")
+    
+    return train_df, val_df, preprocessor
+
+
+def df_to_tensors(df: pd.DataFrame, cat_features: list, num_features: list):
+    """Convert dataframe to PyTorch tensors."""
+    x_cat = torch.tensor(df[cat_features].values, dtype=torch.long)
+    x_num = torch.tensor(df[num_features].values, dtype=torch.float32)
+    y = torch.tensor(df['label_binary'].values, dtype=torch.long)
+    return x_cat, x_num, y
 
 
 def train_epoch(
@@ -111,9 +66,10 @@ def train_epoch(
     dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
-    device: torch.device
+    device: torch.device,
+    scaler: torch.amp.GradScaler  # Mixed precision
 ) -> float:
-    """Train for one epoch, return average loss."""
+    """Train for one epoch with AMP, return average loss."""
     model.train()
     total_loss = 0.0
     
@@ -121,10 +77,16 @@ def train_epoch(
         x_cat, x_num, y = x_cat.to(device), x_num.to(device), y.to(device)
         
         optimizer.zero_grad()
-        logits = model(x_cat, x_num)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
+        
+        # Mixed precision forward pass
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits = model(x_cat, x_num)
+            loss = criterion(logits, y)
+        
+        # Scaled backward pass
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item() * len(y)
     
@@ -144,9 +106,11 @@ def evaluate(
     with torch.no_grad():
         for x_cat, x_num, y in dataloader:
             x_cat, x_num = x_cat.to(device), x_num.to(device)
-            logits = model(x_cat, x_num)
-            preds = logits.argmax(dim=1).cpu().numpy()
             
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                logits = model(x_cat, x_num)
+            
+            preds = logits.argmax(dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_labels.extend(y.numpy())
     
@@ -180,155 +144,153 @@ def measure_inference_time(
             _ = model(x_cat_sample[:1], x_num_sample[:1])
     elapsed = time.perf_counter() - start
     
-    return (elapsed / num_runs) * 1e6  # Convert to microseconds
+    return (elapsed / num_runs) * 1e6
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Rotary FT-Transformer")
-    parser.add_argument("--data", type=Path, default=Path("data/processed/dataset.parquet"))
-    parser.add_argument("--max-samples", type=int, default=None, help="Limit samples for testing")
+    parser = argparse.ArgumentParser(description="Train Rotary FT-Transformer (Fast)")
+    parser.add_argument("--data-dir", type=Path, default=Path("data/processed"))
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--n-folds", type=int, default=5)
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--save-dir", type=Path, default=Path("models/checkpoints"))
+    parser.add_argument("--num-workers", type=int, default=4)
     args = parser.parse_args()
     
     logger.info("=" * 60)
-    logger.info("Phase 3: Rotary FT-Transformer Training")
+    logger.info("Phase 3: Rotary FT-Transformer Training (FAST)")
     logger.info("=" * 60)
     
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device: {device}")
+    if device.type == 'cuda':
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
     
-    # Load data
-    logger.info(f"Loading data from {args.data}...")
-    df = pd.read_parquet(args.data)
+    # Load pre-processed data
+    logger.info("Loading pre-processed data...")
+    try:
+        train_df, val_df, preprocessor = load_preprocessed_data(args.data_dir)
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return
     
-    if args.max_samples:
-        df = df.sample(n=min(args.max_samples, len(df)), random_state=42)
-        logger.info(f"Limited to {len(df):,} samples")
+    cat_features = preprocessor['cat_features']
+    num_features = preprocessor['num_features']
+    cat_cardinalities = preprocessor['cat_cardinalities']
     
-    logger.info(f"Total samples: {len(df):,}")
-    logger.info(f"Class distribution: {df['label_binary'].value_counts().to_dict()}")
+    logger.info(f"Train: {len(train_df):,} | Val: {len(val_df):,}")
+    logger.info(f"Class dist (train): {train_df['label_binary'].value_counts().to_dict()}")
     
-    # Fix column naming (tcp_dataofs vs tcp_dataoff)
-    if 'tcp_dataoff' in df.columns and 'tcp_dataofs' not in df.columns:
-        df['tcp_dataofs'] = df['tcp_dataoff']
+    # Convert to tensors
+    logger.info("Converting to tensors...")
+    x_cat_train, x_num_train, y_train = df_to_tensors(train_df, cat_features, num_features)
+    x_cat_val, x_num_val, y_val = df_to_tensors(val_df, cat_features, num_features)
     
-    # Preprocess
-    dataset = TrafficDataset(df, CATEGORICAL_FEATURES, NUMERICAL_FEATURES)
-    dataset.preprocess()
+    # Free memory
+    del train_df, val_df
     
-    # GroupKFold by flow_id
-    logger.info(f"Setting up {args.n_folds}-fold GroupKFold by flow_id...")
-    groups = df['flow_id'].values
-    gkf = GroupKFold(n_splits=args.n_folds)
+    # DataLoaders with pinned memory for faster GPU transfer
+    train_ds = TensorDataset(x_cat_train, x_num_train, y_train)
+    val_ds = TensorDataset(x_cat_val, x_num_val, y_val)
     
-    fold_results = []
+    train_loader = DataLoader(
+        train_ds, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, 
+        batch_size=args.batch_size, 
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
     
-    for fold, (train_idx, val_idx) in enumerate(gkf.split(df, df['label_binary'], groups)):
-        logger.info("-" * 40)
-        logger.info(f"Fold {fold + 1}/{args.n_folds}")
-        logger.info(f"  Train: {len(train_idx):,} | Val: {len(val_idx):,}")
+    logger.info(f"Batch size: {args.batch_size} | Train batches: {len(train_loader)}")
+    
+    # Create model
+    model_config = {
+        "embed_dim": args.embed_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "ff_dim": args.embed_dim * 4,
+        "dropout": 0.1
+    }
+    
+    model = create_model(
+        cat_cardinalities=cat_cardinalities,
+        num_features=num_features,
+        num_classes=2,
+        config=model_config
+    ).to(device)
+    
+    logger.info(f"Model parameters: {model.count_parameters():,}")
+    
+    # Optimizer, scheduler, criterion
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Mixed precision scaler
+    scaler = torch.amp.GradScaler()
+    
+    # Training loop
+    logger.info("-" * 40)
+    best_f1 = 0.0
+    
+    for epoch in range(args.epochs):
+        epoch_start = time.time()
         
-        # Get tensors
-        x_cat_train, x_num_train, y_train = dataset.get_tensors(train_idx)
-        x_cat_val, x_num_val, y_val = dataset.get_tensors(val_idx)
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+        val_acc, val_f1 = evaluate(model, val_loader, device)
+        scheduler.step()
         
-        # DataLoaders
-        train_ds = TensorDataset(x_cat_train, x_num_train, y_train)
-        val_ds = TensorDataset(x_cat_val, x_num_val, y_val)
+        epoch_time = time.time() - epoch_start
         
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-        
-        # Create model
-        model_config = {
-            "embed_dim": args.embed_dim,
-            "num_heads": args.num_heads,
-            "num_layers": args.num_layers,
-            "ff_dim": args.embed_dim * 4,
-            "dropout": 0.1
-        }
-        
-        model = create_model(
-            cat_cardinalities=dataset.cat_cardinalities,
-            num_features=NUMERICAL_FEATURES,
-            num_classes=2,
-            config=model_config
-        ).to(device)
-        
-        if fold == 0:
-            logger.info(f"  Model parameters: {model.count_parameters():,}")
-        
-        # Optimizer and scheduler
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay
+        logger.info(
+            f"Epoch {epoch+1:2d}/{args.epochs} | "
+            f"Loss: {train_loss:.4f} | "
+            f"Val Acc: {val_acc:.4f} | "
+            f"Val F1: {val_f1:.4f} | "
+            f"Time: {epoch_time:.1f}s"
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs
-        )
-        criterion = nn.CrossEntropyLoss()
         
-        # Training loop
-        best_f1 = 0.0
-        for epoch in range(args.epochs):
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
-            val_acc, val_f1 = evaluate(model, val_loader, device)
-            scheduler.step()
-            
-            logger.info(
-                f"  Epoch {epoch+1:2d}/{args.epochs} | "
-                f"Loss: {train_loss:.4f} | "
-                f"Val Acc: {val_acc:.4f} | "
-                f"Val F1: {val_f1:.4f}"
-            )
-            
-            if val_f1 > best_f1:
-                best_f1 = val_f1
-        
-        fold_results.append({
-            "fold": fold + 1,
-            "best_f1": best_f1,
-            "final_acc": val_acc
-        })
-        
-        # Measure inference time (only on first fold)
-        if fold == 0:
-            inference_time = measure_inference_time(model, x_cat_val, x_num_val)
-            logger.info(f"  Inference time: {inference_time:.2f} μs/packet (CPU)")
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            # Save best model
+            args.save_dir.mkdir(parents=True, exist_ok=True)
+            save_path = args.save_dir / "best_model.pt"
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "cat_cardinalities": cat_cardinalities,
+                "num_features": num_features,
+                "model_config": model_config,
+                "best_f1": best_f1,
+                "epoch": epoch + 1
+            }, save_path)
     
-    # Summary
+    # Final results
     logger.info("=" * 60)
-    logger.info("CROSS-VALIDATION RESULTS")
+    logger.info("TRAINING COMPLETE")
     logger.info("=" * 60)
+    logger.info(f"Best Val F1: {best_f1:.4f}")
     
-    f1_scores = [r['best_f1'] for r in fold_results]
-    acc_scores = [r['final_acc'] for r in fold_results]
+    # Measure inference time
+    inference_time = measure_inference_time(model, x_cat_val, x_num_val)
+    logger.info(f"Inference time: {inference_time:.2f} μs/packet (CPU)")
     
-    logger.info(f"Macro F1:  {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
-    logger.info(f"Accuracy:  {np.mean(acc_scores):.4f} ± {np.std(acc_scores):.4f}")
-    
-    # Save final model
-    args.save_dir.mkdir(parents=True, exist_ok=True)
-    save_path = args.save_dir / "rotary_ft_transformer.pt"
-    torch.save({
-        "model_state_dict": model.state_dict(),
-        "cat_cardinalities": dataset.cat_cardinalities,
-        "num_features": NUMERICAL_FEATURES,
-        "model_config": model_config,
-        "cv_results": fold_results
-    }, save_path)
-    logger.info(f"Model saved to {save_path}")
-    
+    logger.info(f"Best model saved to {args.save_dir / 'best_model.pt'}")
     logger.info("Done!")
 
 
