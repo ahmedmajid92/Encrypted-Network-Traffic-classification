@@ -74,52 +74,80 @@ def evaluate_model(model, dataloader, device):
     return np.array(all_preds), np.array(all_probs), np.array(all_labels)
 
 
-def measure_inference_time(model, x_cat, x_num, device, num_runs=1000):
-    """Measure inference time per packet."""
+def measure_throughput(model, x_cat, x_num, device, batch_sizes=[1, 64, 256, 1024, 4096]):
+    """
+    Measure BATCHED throughput at various batch sizes.
+    Returns throughput in packets/sec for thesis-quality benchmarks.
+    """
     model.eval()
+    results = {}
     
-    # GPU inference
-    x_cat_gpu = x_cat[:1].to(device)
-    x_num_gpu = x_num[:1].to(device)
+    for batch_size in batch_sizes:
+        # Prepare batch
+        actual_batch = min(batch_size, len(x_cat))
+        x_cat_batch = x_cat[:actual_batch].to(device)
+        x_num_batch = x_num[:actual_batch].to(device)
+        
+        # Warmup (important for GPU)
+        with torch.no_grad():
+            for _ in range(10):
+                _ = model(x_cat_batch, x_num_batch)
+        
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        # Benchmark multiple runs
+        num_runs = max(100, 10000 // batch_size)  # More runs for small batches
+        
+        start = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(num_runs):
+                _ = model(x_cat_batch, x_num_batch)
+        
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        
+        elapsed = time.perf_counter() - start
+        total_packets = num_runs * actual_batch
+        throughput = total_packets / elapsed
+        latency_per_packet = (elapsed / total_packets) * 1e6  # microseconds
+        
+        results[batch_size] = {
+            'throughput': throughput,
+            'latency_us': latency_per_packet,
+            'total_packets': total_packets,
+            'elapsed_sec': elapsed
+        }
+    
+    return results
+
+
+def measure_cpu_throughput(model, x_cat, x_num, batch_size=1024):
+    """Measure CPU throughput for deployment scenarios."""
+    model_cpu = model.cpu()
+    model_cpu.eval()
+    
+    actual_batch = min(batch_size, len(x_cat))
+    x_cat_batch = x_cat[:actual_batch].cpu()
+    x_num_batch = x_num[:actual_batch].cpu()
     
     # Warmup
     with torch.no_grad():
-        for _ in range(100):
-            _ = model(x_cat_gpu, x_num_gpu)
+        for _ in range(10):
+            _ = model_cpu(x_cat_batch, x_num_batch)
     
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    
+    # Benchmark
+    num_runs = 100
     start = time.perf_counter()
     with torch.no_grad():
         for _ in range(num_runs):
-            _ = model(x_cat_gpu, x_num_gpu)
+            _ = model_cpu(x_cat_batch, x_num_batch)
     
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+    total_packets = num_runs * actual_batch
+    throughput = total_packets / elapsed
     
-    gpu_time = (time.perf_counter() - start) / num_runs * 1e6
-    
-    # CPU inference
-    model_cpu = model.cpu()
-    x_cat_cpu = x_cat[:1].cpu()
-    x_num_cpu = x_num[:1].cpu()
-    
-    with torch.no_grad():
-        for _ in range(100):
-            _ = model_cpu(x_cat_cpu, x_num_cpu)
-    
-    start = time.perf_counter()
-    with torch.no_grad():
-        for _ in range(num_runs):
-            _ = model_cpu(x_cat_cpu, x_num_cpu)
-    
-    cpu_time = (time.perf_counter() - start) / num_runs * 1e6
-    
-    # Move model back to original device
-    model.to(device)
-    
-    return gpu_time, cpu_time
+    return throughput, (elapsed / total_packets) * 1e6
 
 
 def main():
@@ -204,14 +232,32 @@ def main():
         digits=4
     ))
     
-    # Inference time
-    print("⏱️  Inference Time:")
+    
+    # BATCHED Throughput (Thesis-quality benchmarks)
+    print("\n🚀 BATCHED THROUGHPUT (GPU):")
+    print("-" * 50)
+    print(f"{'Batch Size':<12} {'Throughput':>18} {'Latency':>15}")
+    print(f"{'':12} {'(packets/sec)':>18} {'(μs/packet)':>15}")
+    print("-" * 50)
+    
+    throughput_results = measure_throughput(model, x_cat, x_num, device)
+    for batch_size, metrics in throughput_results.items():
+        print(f"{batch_size:<12} {metrics['throughput']:>18,.0f} {metrics['latency_us']:>15.2f}")
+    
+    # Best throughput for thesis
+    best_batch = max(throughput_results.keys())
+    best_throughput = throughput_results[best_batch]['throughput']
+    print("-" * 50)
+    print(f"⭐ Peak Throughput: {best_throughput:,.0f} packets/sec (batch={best_batch})")
+    
+    # CPU throughput
+    print("\n🖥️  CPU THROUGHPUT (batch=1024):")
     print("-" * 40)
-    gpu_time, cpu_time = measure_inference_time(model, x_cat, x_num, device)
-    print(f"   GPU: {gpu_time:.2f} μs/packet")
-    print(f"   CPU: {cpu_time:.2f} μs/packet")
-    print(f"   Throughput (GPU): {1e6/gpu_time:,.0f} packets/sec")
-    print(f"   Throughput (CPU): {1e6/cpu_time:,.0f} packets/sec")
+    model.to(device)  # Reset model to GPU first
+    cpu_throughput, cpu_latency = measure_cpu_throughput(model, x_cat, x_num, batch_size=1024)
+    print(f"   Throughput: {cpu_throughput:,.0f} packets/sec")
+    print(f"   Latency: {cpu_latency:.2f} μs/packet")
+    model.to(device)  # Move back to GPU
     
     # Save results
     results = {
@@ -221,8 +267,10 @@ def main():
         'f1_macro': f1_macro,
         'f1_weighted': f1_weighted,
         'confusion_matrix': cm.tolist(),
-        'inference_time_gpu_us': gpu_time,
-        'inference_time_cpu_us': cpu_time,
+        'throughput_results': {k: v for k, v in throughput_results.items()},
+        'peak_throughput_gpu': best_throughput,
+        'peak_batch_size': best_batch,
+        'cpu_throughput': cpu_throughput,
         'test_samples': len(test_df)
     }
     
